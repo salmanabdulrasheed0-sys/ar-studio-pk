@@ -8,10 +8,17 @@ from flask_cors import CORS
 import requests
 import os
 import io
+import logging
 import zipfile
 import qrcode
 from typing import Optional
 from supabase import create_client
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)  # Frontend ko allow karo API call karne ke liye
@@ -23,16 +30,31 @@ SUPABASE_KEY = os.environ.get('SUPABASE_KEY', '')   # Service Role Key
 APP_BASE_URL = os.environ.get('APP_BASE_URL', '')    # https://yourapp.onrender.com
 # ─────────────────────────────────────────────────────────────────
 
+_REQUIRED_ENV = {'KIRI_API_KEY': KIRI_API_KEY, 'SUPABASE_URL': SUPABASE_URL, 'SUPABASE_KEY': SUPABASE_KEY}
+_missing = [k for k, v in _REQUIRED_ENV.items() if not v]
+if _missing:
+    logger.warning("Missing required environment variables: %s — some routes will fail.", ', '.join(_missing))
+
 KIRI_BASE    = "https://api.kiriengine.app/api/v1/open"
 KIRI_HEADERS = {"Authorization": f"Bearer {KIRI_API_KEY}"}
 
 # Supabase client
-supa = create_client(SUPABASE_URL, SUPABASE_KEY)
+try:
+    supa = create_client(SUPABASE_URL, SUPABASE_KEY)
+except Exception as e:
+    logger.error("Failed to initialise Supabase client: %s", e)
+    supa = None
 
 
 # ════════════════════════════════════════════════════════════════
 # ROUTE 1 — Health Check
 # ════════════════════════════════════════════════════════════════
+@app.errorhandler(Exception)
+def handle_unexpected_error(exc):
+    logger.exception("Unhandled exception on %s %s", request.method, request.path)
+    return jsonify(error="Internal server error"), 500
+
+
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({"status": "✅ AR Studio PK Backend running!"})
@@ -72,9 +94,15 @@ def upload_video():
         return jsonify(error=f"Upload error: {str(e)}"), 500
 
     if not kiri_resp.ok:
+        logger.error("Kiri upload returned HTTP %s: %s", kiri_resp.status_code, kiri_resp.text[:500])
         return jsonify(error="Kiri Engine error", detail=kiri_resp.text), 500
 
-    kiri_data = kiri_resp.json()
+    try:
+        kiri_data = kiri_resp.json()
+    except ValueError:
+        logger.error("Kiri upload returned non-JSON response: %s", kiri_resp.text[:500])
+        return jsonify(error="Invalid response from Kiri Engine"), 502
+
     if not kiri_data.get('ok'):
         code = kiri_data.get('code', '')
         if code == 4011:
@@ -83,7 +111,11 @@ def upload_video():
             return jsonify(error="Video format galat hai. MP4 use karo, max 1080p, max 3 min."), 400
         return jsonify(error="Kiri rejected request", detail=kiri_data), 400
 
-    sid = kiri_data['data']['serialize']
+    try:
+        sid = kiri_data['data']['serialize']
+    except (KeyError, TypeError) as e:
+        logger.error("Unexpected Kiri response structure: %s — response: %s", e, kiri_data)
+        return jsonify(error="Unexpected response from Kiri Engine"), 502
 
     # ── Supabase mein save karo ──────────────────────────────────
     try:
@@ -141,19 +173,29 @@ def check_status(sid):
             params={"serialize": sid},
             timeout=30
         )
-        kiri_status = kiri_resp.json()['data']['status']
-    except Exception:
-        return jsonify(status='processing')  # Agar kiri unreachable ho, processing assume karo
+        kiri_resp.raise_for_status()
+        kiri_data = kiri_resp.json()
+        kiri_status = kiri_data['data']['status']
+    except requests.exceptions.RequestException as e:
+        logger.warning("Kiri status check network error for %s: %s", sid, e)
+        return jsonify(status='processing', note='Status service temporarily unreachable')
+    except (ValueError, KeyError, TypeError) as e:
+        logger.error("Kiri status check returned unexpected payload for %s: %s", sid, e)
+        return jsonify(status='processing', note='Received unexpected status response')
 
     LABELS = {-1: 'uploading', 3: 'queuing', 0: 'processing', 2: 'ready', 1: 'failed', 4: 'expired'}
 
     if kiri_status == 2:  # SUCCESS — GLB download karo!
         glb_url = _download_and_store_glb(sid)
         if glb_url:
-            supa.table('models').update({
-                'status':  'ready',
-                'glb_url': glb_url
-            }).eq('serialize_id', sid).execute()
+            try:
+                supa.table('models').update({
+                    'status':  'ready',
+                    'glb_url': glb_url
+                }).eq('serialize_id', sid).execute()
+            except Exception as e:
+                logger.error("DB update to 'ready' failed for %s (GLB already uploaded): %s", sid, e)
+                return jsonify(error="Model processed but failed to update database"), 500
             return jsonify(
                 status = 'ready',
                 ar_url = f"{APP_BASE_URL}/api/ar/{sid}",
@@ -163,7 +205,10 @@ def check_status(sid):
             return jsonify(status='failed', message='GLB store karne mein error aya.'), 500
 
     if kiri_status in [1, 4]:  # FAILED or EXPIRED
-        supa.table('models').update({'status': 'failed'}).eq('serialize_id', sid).execute()
+        try:
+            supa.table('models').update({'status': 'failed'}).eq('serialize_id', sid).execute()
+        except Exception as e:
+            logger.error("DB update to 'failed' failed for %s: %s", sid, e)
         return jsonify(status='failed', message='Processing fail hui. Better video try karo.')
 
     return jsonify(status=LABELS.get(kiri_status, 'processing'))
@@ -171,38 +216,56 @@ def check_status(sid):
 
 def _download_and_store_glb(sid: str) -> Optional[str]:
     """Kiri se ZIP download karo, GLB extract karo, Supabase mein store karo"""
+    # Download URL lo
     try:
-        # Download URL lo
-        r        = requests.get(f"{KIRI_BASE}/model/getModelZip",
-                                headers=KIRI_HEADERS,
-                                params={"serialize": sid}, timeout=30)
-        zip_url  = r.json()['data']['modelUrl']
+        r = requests.get(f"{KIRI_BASE}/model/getModelZip",
+                         headers=KIRI_HEADERS,
+                         params={"serialize": sid}, timeout=30)
+        r.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        logger.error("Failed to fetch model ZIP URL for %s: %s", sid, e)
+        return None
 
-        # ZIP download karo
-        zip_data = requests.get(zip_url, timeout=120).content
+    try:
+        zip_url = r.json()['data']['modelUrl']
+    except (ValueError, KeyError, TypeError) as e:
+        logger.error("Unexpected getModelZip response for %s: %s — body: %s", sid, e, r.text[:500])
+        return None
 
-        # GLB extract karo
-        with zipfile.ZipFile(io.BytesIO(zip_data)) as z:
+    # ZIP download karo
+    try:
+        zip_resp = requests.get(zip_url, timeout=120)
+        zip_resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        logger.error("Failed to download ZIP for %s from %s: %s", sid, zip_url, e)
+        return None
+
+    # GLB extract karo
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as z:
             glb_files = [f for f in z.namelist() if f.endswith('.glb')]
             if not glb_files:
-                print(f"No GLB in ZIP for {sid}")
+                logger.error("No .glb file found in ZIP for %s (contents: %s)", sid, z.namelist())
                 return None
             glb_data = z.read(glb_files[0])
+    except zipfile.BadZipFile as e:
+        logger.error("Corrupt ZIP for %s: %s", sid, e)
+        return None
 
-        # Supabase Storage mein upload karo
-        file_path = f"{sid}.glb"
+    # Supabase Storage mein upload karo
+    file_path = f"{sid}.glb"
+    try:
         supa.storage.from_('ar-models').upload(
             file_path,
             glb_data,
             file_options={"content-type": "model/gltf-binary"}
         )
-
-        # Public URL lo
-        return supa.storage.from_('ar-models').get_public_url(file_path)
-
     except Exception as e:
-        print(f"_download_and_store_glb error: {e}")
+        logger.error("Supabase storage upload failed for %s: %s", sid, e)
         return None
+
+    # Public URL lo
+    return supa.storage.from_('ar-models').get_public_url(file_path)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -213,7 +276,8 @@ def _download_and_store_glb(sid: str) -> Optional[str]:
 def ar_viewer(sid):
     try:
         row = supa.table('models').select('glb_url, status').eq('serialize_id', sid).execute()
-    except:
+    except Exception:
+        logger.exception("DB query failed in ar_viewer for %s", sid)
         return "Database error", 500
 
     if not row.data:
@@ -320,19 +384,23 @@ def ar_viewer(sid):
 def get_qr_code(sid):
     ar_url = f"{APP_BASE_URL}/api/ar/{sid}"
 
-    qr = qrcode.QRCode(
-        version             = 1,
-        error_correction    = qrcode.constants.ERROR_CORRECT_M,
-        box_size            = 12,
-        border              = 4
-    )
-    qr.add_data(ar_url)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="#7c3aed", back_color="white")
+    try:
+        qr = qrcode.QRCode(
+            version             = 1,
+            error_correction    = qrcode.constants.ERROR_CORRECT_M,
+            box_size            = 12,
+            border              = 4
+        )
+        qr.add_data(ar_url)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="#7c3aed", back_color="white")
 
-    buf = io.BytesIO()
-    img.save(buf, format='PNG')
-    buf.seek(0)
+        buf = io.BytesIO()
+        img.save(buf, format='PNG')
+        buf.seek(0)
+    except Exception:
+        logger.exception("QR code generation failed for %s", sid)
+        return jsonify(error="Failed to generate QR code"), 500
 
     return send_file(buf, mimetype='image/png', download_name=f'ar-qr-{sid[:8]}.png')
 
