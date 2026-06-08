@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Optional
 
@@ -9,10 +10,17 @@ from supabase import create_client, Client
 
 from utils.responses import db_error_response, error_response
 
+logger = logging.getLogger(__name__)
+
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
 _client: Optional[Client] = None
+
+_REQUIRED_ENV = {"SUPABASE_URL": SUPABASE_URL, "SUPABASE_KEY": SUPABASE_KEY}
+_missing = [k for k, v in _REQUIRED_ENV.items() if not v]
+if _missing:
+    logger.warning("Missing Supabase env vars: %s — database calls will fail.", ", ".join(_missing))
 
 
 def get_supabase() -> Client:
@@ -20,7 +28,11 @@ def get_supabase() -> Client:
     during import)."""
     global _client
     if _client is None:
-        _client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        try:
+            _client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        except Exception as e:
+            logger.error("Failed to initialise Supabase client: %s", e)
+            raise
     return _client
 
 
@@ -41,6 +53,7 @@ def get_model(sid: str, columns: str = "*"):
             .execute()
         )
     except Exception as e:
+        logger.error("DB query failed for model %s: %s", sid, e)
         return None, db_error_response(e)
 
     if not result.data:
@@ -61,6 +74,7 @@ def create_model(sid: str):
             {"serialize_id": sid, "status": "processing", "glb_url": None}
         ).execute()
     except Exception as e:
+        logger.error("DB insert failed for model %s: %s", sid, e)
         return db_error_response(e)
     return None
 

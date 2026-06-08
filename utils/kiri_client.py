@@ -6,14 +6,20 @@ boilerplate.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
 import requests
 
+logger = logging.getLogger(__name__)
+
 KIRI_API_KEY = os.environ.get("KIRI_API_KEY", "")
 KIRI_BASE = "https://api.kiriengine.app/api/v1/open"
 KIRI_HEADERS = {"Authorization": f"Bearer {KIRI_API_KEY}"}
+
+if not KIRI_API_KEY:
+    logger.warning("KIRI_API_KEY not set — Kiri Engine calls will fail.")
 
 
 def kiri_request(
