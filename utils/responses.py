@@ -1,14 +1,17 @@
+import logging
+
 from flask import jsonify
 
+logger = logging.getLogger(__name__)
 
-def error_response(message: str, status_code: int = 400, detail=None):
+
+def error_response(message: str, status_code: int = 400):
     """Standardised JSON error envelope."""
-    payload = {"error": message}
-    if detail is not None:
-        payload["detail"] = detail
-    return jsonify(payload), status_code
+    return jsonify({"error": message}), status_code
 
 
 def db_error_response(exc: Exception):
-    """Shorthand for database-layer errors."""
-    return error_response(f"DB error: {exc}", status_code=500)
+    """Shorthand for database-layer errors.  Logs the real exception
+    server-side but returns a generic message to the client."""
+    logger.exception("Database error")
+    return error_response("Database error. Please try again later.", status_code=500)

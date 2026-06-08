@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Optional
 
 from supabase import create_client, Client
 
 from utils.responses import db_error_response, error_response
+
+logger = logging.getLogger(__name__)
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
@@ -16,10 +19,13 @@ _client: Optional[Client] = None
 
 
 def get_supabase() -> Client:
-    """Lazy-initialised Supabase client (avoids crash when env vars are empty
-    during import)."""
+    """Lazy-initialised Supabase client.  Raises RuntimeError when env vars
+    are missing so callers get a clear 503 instead of a cryptic Supabase error."""
     global _client
     if _client is None:
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            logger.error("SUPABASE_URL and SUPABASE_KEY must be set.")
+            raise RuntimeError("Database not configured")
         _client = create_client(SUPABASE_URL, SUPABASE_KEY)
     return _client
 

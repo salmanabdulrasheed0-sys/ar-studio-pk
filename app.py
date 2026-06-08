@@ -3,11 +3,13 @@
 # Platform: Render.com (Free Tier)
 # ================================================================
 
-from flask import Flask, request, jsonify, send_file, render_template
+from flask import Flask, request, jsonify, send_file, render_template, abort
 from flask_cors import CORS
 import requests
 import io
 import os
+import re
+import logging
 import zipfile
 import qrcode
 from typing import Optional
@@ -17,8 +19,45 @@ from utils.urls import build_ar_url, build_model_urls
 from utils.database import get_supabase, get_model, create_model, update_model_status
 from utils.kiri_client import upload_video, get_status, get_model_zip_url
 
+# ── Logging ───────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
-CORS(app)  # Frontend ko allow karo API call karne ke liye
+
+# ── CORS — restrict to configured origins ─────────────────────────
+ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', '')
+if ALLOWED_ORIGINS:
+    CORS(app, origins=[o.strip() for o in ALLOWED_ORIGINS.split(',')])
+else:
+    CORS(app)
+    logger.warning(
+        "ALLOWED_ORIGINS not set — CORS is open to all origins. "
+        "Set ALLOWED_ORIGINS env var for production."
+    )
+
+# ── Upload constraints ────────────────────────────────────────────
+MAX_UPLOAD_BYTES = int(os.environ.get('MAX_UPLOAD_MB', '50')) * 1024 * 1024
+ALLOWED_VIDEO_TYPES = {'video/mp4', 'video/quicktime', 'video/x-msvideo', 'video/webm'}
+UPLOAD_API_KEY = os.environ.get('UPLOAD_API_KEY', '')
+
+# ── Helpers ───────────────────────────────────────────────────────
+_SID_RE = re.compile(r'^[a-zA-Z0-9_-]{1,128}$')
+
+def _valid_sid(sid: str) -> bool:
+    return bool(_SID_RE.match(sid))
+
+
+# ── Security headers ──────────────────────────────────────────────
+@app.after_request
+def _set_security_headers(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=()'
+    if request.is_secure:
+        response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    return response
 
 
 # ════════════════════════════════════════════════════════════════
@@ -26,7 +65,7 @@ CORS(app)  # Frontend ko allow karo API call karne ke liye
 # ════════════════════════════════════════════════════════════════
 @app.route('/', methods=['GET'])
 def home():
-    return jsonify({"status": "✅ AR Studio PK Backend running!"})
+    return jsonify({"status": "ok"})
 
 
 # ════════════════════════════════════════════════════════════════
@@ -36,22 +75,46 @@ def home():
 # ════════════════════════════════════════════════════════════════
 @app.route('/api/upload', methods=['POST'])
 def upload_video_route():
+    # ── Optional API-key authentication ───────────────────────────
+    if UPLOAD_API_KEY:
+        auth = request.headers.get('Authorization', '')
+        if auth != f"Bearer {UPLOAD_API_KEY}":
+            return error_response("Unauthorized", 401)
+
     if 'video' not in request.files:
         return error_response("Video file required", 400)
 
     video   = request.files['video']
     quality = request.form.get('quality', '1')  # 0=High 1=Medium 2=Low
 
+    # ── Validate quality parameter ────────────────────────────────
+    if quality not in ('0', '1', '2'):
+        return error_response("quality must be 0, 1, or 2", 400)
+
+    # ── Validate file type ────────────────────────────────────────
+    if video.content_type not in ALLOWED_VIDEO_TYPES:
+        return error_response("Unsupported video format. Use MP4, MOV, AVI, or WebM.", 400)
+
+    # ── Validate file size ────────────────────────────────────────
+    video.seek(0, io.SEEK_END)
+    size = video.tell()
+    video.seek(0)
+    if size > MAX_UPLOAD_BYTES:
+        max_mb = MAX_UPLOAD_BYTES // (1024 * 1024)
+        return error_response(f"File too large. Maximum {max_mb} MB allowed.", 413)
+
     # ── Kiri Engine pe upload karo ──────────────────────────────
     try:
         kiri_resp = upload_video(video, quality)
     except requests.exceptions.Timeout:
         return error_response("Timeout! Video bahut bari hai ya internet slow hai.", 408)
-    except Exception as e:
-        return error_response(f"Upload error: {e}", 500)
+    except Exception:
+        logger.exception("Kiri upload failed")
+        return error_response("Upload failed. Please try again later.", 500)
 
     if not kiri_resp.ok:
-        return error_response("Kiri Engine error", 500, detail=kiri_resp.text)
+        logger.error("Kiri Engine error: %s", kiri_resp.text)
+        return error_response("Processing service error", 500)
 
     kiri_data = kiri_resp.json()
     if not kiri_data.get('ok'):
@@ -60,7 +123,8 @@ def upload_video_route():
             return error_response("Kiri Engine credits khatam hain!", 403)
         if code == 4001:
             return error_response("Video format galat hai. MP4 use karo, max 1080p, max 3 min.", 400)
-        return error_response("Kiri rejected request", 400, detail=kiri_data)
+        logger.warning("Kiri rejected: %s", kiri_data)
+        return error_response("Processing service rejected request", 400)
 
     sid = kiri_data['data']['serialize']
 
@@ -78,6 +142,9 @@ def upload_video_route():
 # ════════════════════════════════════════════════════════════════
 @app.route('/api/status/<sid>', methods=['GET'])
 def check_status(sid):
+    if not _valid_sid(sid):
+        return error_response("Invalid ID format", 400)
+
     record, err = get_model(sid)
     if err is not None:
         return err
@@ -125,11 +192,14 @@ def _download_and_store_glb(sid: str) -> Optional[str]:
         # ZIP download karo
         zip_data = requests.get(zip_url, timeout=120).content
 
-        # GLB extract karo
+        # GLB extract karo (safe extraction — reject path traversal)
         with zipfile.ZipFile(io.BytesIO(zip_data)) as z:
-            glb_files = [f for f in z.namelist() if f.endswith('.glb')]
+            glb_files = [
+                f for f in z.namelist()
+                if f.endswith('.glb') and '..' not in f and not f.startswith('/')
+            ]
             if not glb_files:
-                print(f"No GLB in ZIP for {sid}")
+                logger.warning("No GLB in ZIP for %s", sid)
                 return None
             glb_data = z.read(glb_files[0])
 
@@ -144,8 +214,8 @@ def _download_and_store_glb(sid: str) -> Optional[str]:
         # Public URL lo
         return get_supabase().storage.from_('ar-models').get_public_url(file_path)
 
-    except Exception as e:
-        print(f"_download_and_store_glb error: {e}")
+    except Exception:
+        logger.exception("_download_and_store_glb error for sid=%s", sid)
         return None
 
 
@@ -155,6 +225,9 @@ def _download_and_store_glb(sid: str) -> Optional[str]:
 # ════════════════════════════════════════════════════════════════
 @app.route('/api/ar/<sid>', methods=['GET'])
 def ar_viewer(sid):
+    if not _valid_sid(sid):
+        return "Invalid ID", 400
+
     record, err = get_model(sid, columns='glb_url, status')
     if err is not None:
         return err
@@ -163,6 +236,7 @@ def ar_viewer(sid):
     if record['status'] != 'ready' or not record.get('glb_url'):
         return render_template('processing.html'), 202
 
+    # Jinja2 auto-escapes {{ glb_url }} — safe from XSS
     return render_template('ar_viewer.html', glb_url=record['glb_url'])
 
 
@@ -172,6 +246,9 @@ def ar_viewer(sid):
 # ════════════════════════════════════════════════════════════════
 @app.route('/api/qr/<sid>', methods=['GET'])
 def get_qr_code(sid):
+    if not _valid_sid(sid):
+        return error_response("Invalid ID format", 400)
+
     ar_url = build_ar_url(sid)
 
     qr = qrcode.QRCode(
